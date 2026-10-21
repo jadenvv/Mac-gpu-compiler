@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# Rust build output (matches metal_infrence_engine/target/ too)
+target/
+
+# Model weights — re-download from Hugging Face
+metal_infrence_engine/qwen3-0.6b/
+
+# Cargo.lock is intentionally tracked: this is a binary crate (src/main.rs)
+
+# Local-only notes
+claude.MD
