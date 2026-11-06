@@ -11,10 +11,10 @@ use std::thread;
 #[derive(Deserialize, Debug)]
 pub struct Tensor{
     #[serde(default)]
-    name: String,
-    dtype: String,
-    shape: Vec<i32>,
-    data_offsets: Vec<i32>
+    pub name: String,
+    pub dtype: String,
+    pub shape: Vec<i32>,
+    pub data_offsets: Vec<i32>
 }
 
 // subset of config.json needed for the forward pass

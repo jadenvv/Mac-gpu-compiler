@@ -1,7 +1,6 @@
-mod cpu_inference;
 use std::io::{self, Write};
 use std::time::Instant;
-use cpu_inference::{Model, KVCache};
+use metal_infrence_engine::cpu_inference::{Model, KVCache};
 
 fn main() -> io::Result<()>{
     let model = Model::load_model("./qwen3-0.6b/model.safetensors")?;
