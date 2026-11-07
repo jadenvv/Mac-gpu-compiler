@@ -2,8 +2,10 @@
 name = "metal_infrence_engine"
 version = "0.1.0"
 edition = "2024"
+default-run = "metal_infrence_engine"
 
 [dependencies]
 memmap2 = "0.9.11"
+metal = "0.33.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
