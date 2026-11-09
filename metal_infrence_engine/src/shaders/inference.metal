@@ -227,14 +227,14 @@ kernel void qk_norm_rope(
 // out[h] = softmax(q[h] . K[0..=pos] * scale) @ V[0..=pos]   with GQA: each kv head serves
 // exactly two q heads (2 * kv_head and 2 * kv_head + 1), and both run together here so they
 // share one read of that head's K and V.
-// cache layout matches the CPU one: k_cache[t * kv_dim + kv_head * head_dim + i].
+// cache layout matches the CPU one, stored as bf16: k_cache[t * kv_dim + kv_head * head_dim + i].
 // grid: one threadgroup per KV head, head_dim threads (must be 128: 4 simdgroups of 32).
 // Scores use the matvec pattern: a simdgroup owns a position and its lanes cover the head as
-// 32 float4s, so one position's loads are adjacent instead of 4 KB apart.
+// 32 float4s (8 bytes of bf16 each), so one position's loads are adjacent instead of 2 KB apart.
 kernel void attention(
     device const float4* q       [[buffer(0)]],
-    device const float4* k_cache [[buffer(1)]],
-    device const float*  v_cache [[buffer(2)]],
+    device const uint2*  k_cache [[buffer(1)]],
+    device const ushort* v_cache [[buffer(2)]],
     device float*        out     [[buffer(3)]],
     constant AttnParams& p       [[buffer(4)]],
     uint kvh  [[threadgroup_position_in_grid]],
@@ -259,7 +259,8 @@ kernel void attention(
     // scores[t] = q . k[t] * scale, one position per simdgroup
     float local_a = -INFINITY, local_b = -INFINITY;
     for (uint t = sg; t < n_t; t += sgs) {
-        float4 k = k_cache[(t * kv_dim + kvh * hd) / 4 + lane];
+        uint2 u = k_cache[(t * kv_dim + kvh * hd) / 4 + lane];
+        float4 k = as_type<float4>(uint4(u.x << 16, u.x & 0xFFFF0000u, u.y << 16, u.y & 0xFFFF0000u));
         float a = simd_sum(dot(qa, k)) * p.scale;
         float b = simd_sum(dot(qb, k)) * p.scale;
         if (lane == 0) { scores_a[t] = a; scores_b[t] = b; }
@@ -284,15 +285,28 @@ kernel void attention(
     const float inv_b = 1.0f / tg_sum(sum_b, buf, lane, sg, tpg);
 
     // out[i] = sum_t p[t] * v[t][i], one output dim per thread
-    device const float* v = v_cache + kvh * hd + tid;
+    device const ushort* v = v_cache + kvh * hd + tid;
     float acc_a = 0.0f, acc_b = 0.0f;
     for (uint t = 0; t < n_t; t++) {
-        float vt = v[t * kv_dim];
+        float vt = bf16(v[t * kv_dim]);
         acc_a += scores_a[t] * vt;
         acc_b += scores_b[t] * vt;
     }
     out[2 * kvh * hd + tid]       = acc_a * inv_a;
     out[(2 * kvh + 1) * hd + tid] = acc_b * inv_b;
+}
+
+// out[i] = x[i] rounded to bf16 (nearest, ties to even)
+// grid: n threads
+kernel void pack_bf16(
+    device const float* x   [[buffer(0)]],
+    device ushort*      out [[buffer(1)]],
+    constant uint&      n   [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    uint u = as_type<uint>(x[gid]);
+    out[gid] = ushort((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
 }
 
 // *out = index of the largest x[i], lowest index on ties   (cpu: argmax)

@@ -11,7 +11,7 @@
 // one line to mlx_baseline/results/history_<chip>_<prompt>.jsonl (every run, for the chart).
 
 use metal_infrence_engine::cpu_inference::{Config, KVCache, Model};
-use metal_infrence_engine::metal_inference::{MetalKVCache, MetalModel};
+use metal_infrence_engine::metal_inference::{MetalKVCache, MetalModel, KV_ELEM_BYTES};
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -32,6 +32,7 @@ trait Engine
     fn reset(&mut self);
     fn step(&mut self, token: u32, pos: usize) -> Vec<f32>;
     fn model(&self) -> &Model;
+    fn kv_elem_bytes(&self) -> usize;
     // greedy decode: `steps` forward passes starting from `first`, calling on_token with each
     // pass's token as it finishes. Timing it this way counts argmax, as MLX's timing does.
     fn decode(&mut self, first: u32, start_pos: usize, steps: usize, on_token: &mut dyn FnMut(u32))
@@ -52,6 +53,7 @@ impl Engine for Cpu
     fn reset(&mut self) { self.cache = KVCache::new(&self.model.config); }
     fn step(&mut self, token: u32, pos: usize) -> Vec<f32> { self.model.forward(token, pos, &mut self.cache) }
     fn model(&self) -> &Model { &self.model }
+    fn kv_elem_bytes(&self) -> usize { 4 } // f32
 }
 
 struct Metal { model: MetalModel, cache: MetalKVCache, max_seq: usize }
@@ -60,6 +62,7 @@ impl Engine for Metal
     fn reset(&mut self) { self.cache = MetalKVCache::new(&self.model, self.max_seq); }
     fn step(&mut self, token: u32, pos: usize) -> Vec<f32> { self.model.forward(token, pos, &mut self.cache) }
     fn model(&self) -> &Model { &self.model.cpu }
+    fn kv_elem_bytes(&self) -> usize { KV_ELEM_BYTES }
     fn decode(&mut self, first: u32, start_pos: usize, steps: usize, on_token: &mut dyn FnMut(u32))
     {
         self.model.decode(first, start_pos, steps, &mut self.cache, on_token);
@@ -115,8 +118,8 @@ fn weight_bytes_per_token(model: &Model) -> usize
     bytes + model.config.hidden_size * 2
 }
 
-// f32 K and V for every cached position (0..=pos) in every layer
-fn kv_bytes_at(c: &Config, pos: usize) -> usize { 2 * c.num_hidden_layers * (pos + 1) * c.num_key_value_heads * c.head_dim * 4 }
+// K and V for every cached position (0..=pos) in every layer
+fn kv_bytes_at(c: &Config, pos: usize, elem_bytes: usize) -> usize { 2 * c.num_hidden_layers * (pos + 1) * c.num_key_value_heads * c.head_dim * elem_bytes }
 
 fn ms(d: Duration) -> f64 { d.as_secs_f64() * 1e3 }
 
@@ -185,7 +188,7 @@ fn main()
     });
     tokens.truncate(args.decode_steps); // the last pass's token isn't one MLX's run counted
     let total_bytes: usize = (prompt.len()..prompt.len() + args.decode_steps)
-        .map(|pos| weight_bytes + kv_bytes_at(&engine.model().config, pos))
+        .map(|pos| weight_bytes + kv_bytes_at(&engine.model().config, pos, engine.kv_elem_bytes()))
         .sum();
     let decode_s: f64 = step_ms.iter().sum::<f64>() / 1e3;
     let achieved = total_bytes as f64 / decode_s;

@@ -7,7 +7,8 @@
 //    (new_buffer_with_bytes_no_copy) and each tensor is bound with a byte offset.
 //    Apple silicon has unified memory, so the GPU reads the same pages the CPU mapped.
 //  - All activations live in StorageModeShared buffers allocated once (Scratch).
-//  - The KV cache is preallocated per layer for max_seq positions.
+//  - The KV cache is preallocated per layer for max_seq positions, and stored as bf16
+//    because every decode step re-reads all of it. The CPU engine's stays f32.
 //  - Each step encodes the whole token (all 28 layers) into ONE command buffer.
 //    forward() commits, waits, then reads logits straight out of the shared buffer.
 //    decode() commits the next step while the current one runs: argmax runs on the
@@ -45,6 +46,8 @@ const ARGMAX_TG: usize = 1024;
 // the attention kernel's lane layout: 32 lanes * float4, and two q heads per kv head
 const ATTN_HEAD_DIM: usize = 128;
 const ATTN_Q_PER_KV: usize = 2;
+// the KV cache holds bf16
+pub const KV_ELEM_BYTES: usize = 2;
 
 // ---------------------------------------------------------------------------
 // kernel params, must match the structs in inference.metal field-for-field
@@ -80,6 +83,7 @@ struct Pipelines {
     silu_mul: ComputePipelineState,
     add_inplace: ComputePipelineState,
     argmax: ComputePipelineState,
+    pack_bf16: ComputePipelineState,
 }
 
 // f32 activation buffers, same names/sizes as the Vecs at the top of the CPU forward()
@@ -87,14 +91,14 @@ struct Scratch {
     x: Buffer,      // [hidden]
     xn: Buffer,     // [hidden]
     q: Buffer,      // [n_heads * head_dim]
+    k: Buffer,      // [kv_heads * head_dim], this token's K before it's packed into the cache
+    v: Buffer,      // [kv_heads * head_dim], same for V
     att: Buffer,    // [n_heads * head_dim]
     proj: Buffer,   // [hidden]
     gate: Buffer,   // [intermediate]
     up: Buffer,     // [intermediate]
     logits: Buffer, // [vocab]
     token: Buffer,  // [1] u32, forward()'s input token
-    // no k/v here: write k_proj/v_proj output directly into the cache at
-    // offset pos * kv_dim * 4, then run qk_norm_rope on that slice in place
 }
 
 pub struct MetalModel {
@@ -113,7 +117,7 @@ pub struct MetalModel {
 }
 
 pub struct MetalKVCache {
-    // per layer, [max_seq * kv_heads * head_dim] f32, same layout as KVCache
+    // per layer, [max_seq * kv_heads * head_dim] bf16, same layout as KVCache
     k: Vec<Buffer>,
     v: Vec<Buffer>,
     // [max_seq * head_dim / 2] [cos, sin] pairs, read-only after new()
@@ -131,7 +135,9 @@ impl MetalKVCache {
         let c = model.config();
         let kv_dim = c.num_key_value_heads * c.head_dim;
         let alloc = || -> Vec<Buffer> {
-            (0..c.num_hidden_layers).map(|_| new_f32_buffer(&model.device, max_seq * kv_dim)).collect()
+            (0..c.num_hidden_layers)
+                .map(|_| model.device.new_buffer((max_seq * kv_dim * KV_ELEM_BYTES) as u64, MTLResourceOptions::StorageModeShared))
+                .collect()
         };
         MetalKVCache { k: alloc(), v: alloc(), rope: rope_table(&model.device, c, max_seq), max_seq }
     }
@@ -206,6 +212,7 @@ fn compile_pipelines(device: &Device, rows_per_sg: usize) -> Pipelines {
         silu_mul: make("silu_mul"),
         add_inplace: make("add_inplace"),
         argmax: make("argmax"),
+        pack_bf16: make("pack_bf16"),
     }
 }
 
@@ -253,10 +260,13 @@ fn wrap_weights(device: &Device, cpu: &Model) -> (Buffer, HashMap<String, u64>) 
 impl Scratch {
     fn new(device: &Device, c: &Config) -> Self {
         let q_dim = c.num_attention_heads * c.head_dim;
+        let kv_dim = c.num_key_value_heads * c.head_dim;
         Scratch {
             x: new_f32_buffer(device, c.hidden_size),
             xn: new_f32_buffer(device, c.hidden_size),
             q: new_f32_buffer(device, q_dim),
+            k: new_f32_buffer(device, kv_dim),
+            v: new_f32_buffer(device, kv_dim),
             att: new_f32_buffer(device, q_dim),
             proj: new_f32_buffer(device, c.hidden_size),
             gate: new_f32_buffer(device, c.intermediate_size),
@@ -326,7 +336,7 @@ impl MetalModel {
         let q_dim = c.num_attention_heads * c.head_dim;
         let kv_dim = c.num_key_value_heads * c.head_dim;
         // this token's slot in the KV cache, in bytes
-        let kv_off = (pos * kv_dim * 4) as u64;
+        let kv_off = (pos * kv_dim * KV_ELEM_BYTES) as u64;
 
         // the encoder is autoreleased, so without a pool it would pile up for the life of
         // the process. to_owned keeps the command buffer alive past the pool.
@@ -346,11 +356,14 @@ impl MetalModel {
                 self.encode_rmsnorm(enc, &s.x, &w("input_layernorm.weight"), &s.xn, hidden);
                 barrier(enc);
                 self.encode_matvec(enc, &w("self_attn.q_proj.weight"), &s.xn, &s.q, 0, q_dim, hidden);
-                self.encode_matvec(enc, &w("self_attn.k_proj.weight"), &s.xn, k_cache, kv_off, kv_dim, hidden);
-                self.encode_matvec(enc, &w("self_attn.v_proj.weight"), &s.xn, v_cache, kv_off, kv_dim, hidden);
+                self.encode_matvec(enc, &w("self_attn.k_proj.weight"), &s.xn, &s.k, 0, kv_dim, hidden);
+                self.encode_matvec(enc, &w("self_attn.v_proj.weight"), &s.xn, &s.v, 0, kv_dim, hidden);
                 barrier(enc);
                 self.encode_qk_norm_rope(enc, &s.q, 0, &w("self_attn.q_norm.weight"), c.num_attention_heads, pos, cache);
-                self.encode_qk_norm_rope(enc, k_cache, kv_off, &w("self_attn.k_norm.weight"), c.num_key_value_heads, pos, cache);
+                self.encode_qk_norm_rope(enc, &s.k, 0, &w("self_attn.k_norm.weight"), c.num_key_value_heads, pos, cache);
+                self.encode_pack(enc, &s.v, v_cache, kv_off, kv_dim);
+                barrier(enc);
+                self.encode_pack(enc, &s.k, k_cache, kv_off, kv_dim);
                 barrier(enc);
                 self.encode_attention(enc, k_cache, v_cache, pos);
                 barrier(enc);
@@ -411,7 +424,6 @@ impl MetalModel {
         enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(n as u64, 1, 1));
     }
 
-    // out_offset lets k/v projections write straight into the KV cache
     fn encode_matvec(&self, enc: &ComputeCommandEncoderRef, w: &str, x: &Buffer, out: &Buffer, out_offset: u64, rows: usize, cols: usize) {
         // the kernel reads 8 columns at a time and has no cleanup loop for leftovers
         assert_eq!(cols % 8, 0, "{w}: cols {cols} must be a multiple of 8");
@@ -463,6 +475,15 @@ impl MetalModel {
         enc.set_compute_pipeline_state(&self.pipelines.silu_mul);
         enc.set_buffer(0, Some(&self.scratch.gate), 0);
         enc.set_buffer(1, Some(&self.scratch.up), 0);
+        set_params(enc, 2, &(n as u32));
+        let (groups, threads) = grid_1d(n, ELEMENTWISE_TG);
+        enc.dispatch_thread_groups(groups, threads);
+    }
+
+    fn encode_pack(&self, enc: &ComputeCommandEncoderRef, x: &Buffer, out: &Buffer, out_offset: u64, n: usize) {
+        enc.set_compute_pipeline_state(&self.pipelines.pack_bf16);
+        enc.set_buffer(0, Some(x), 0);
+        enc.set_buffer(1, Some(out), out_offset);
         set_params(enc, 2, &(n as u32));
         let (groups, threads) = grid_1d(n, ELEMENTWISE_TG);
         enc.dispatch_thread_groups(groups, threads);

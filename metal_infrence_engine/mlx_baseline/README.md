@@ -65,7 +65,7 @@ Also check that `rustc -vV | grep host` says `aarch64-apple-darwin`.
 
 Notes:
 - Needs a native arm64 Python (pinned in `.python-version`); under Rosetta, MLX won't load.
-- MLX keeps the KV cache in bf16 (our engine: f32), so its KV bytes are counted at 2 bytes.
+- MLX and the Metal engine keep the KV cache in bf16, so their KV bytes are counted at 2 bytes (CPU engine: f32, 4 bytes).
 - Greedy output drifts between engines after a few tokens because bf16 logits tie
   (e.g. " France" vs " Italy" both 16.625 on the paris prompt); the CPU engine is the
   correctness reference, not MLX.
