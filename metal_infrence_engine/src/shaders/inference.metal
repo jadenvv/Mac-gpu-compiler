@@ -120,13 +120,18 @@ kernel void rmsnorm(
 
 // out[r] = sum_c bf16(w[r * cols + c]) * x[c]    (cpu: matvec + dot_bf16)
 // This is where ~all decode time goes, so it decides your MBU.
-// suggested mapping: one simdgroup (32 threads) per row; lanes stride over cols,
-//       then simd_sum(). Grid = rows simdgroups, e.g. threadgroups of 256 threads
-//       = 8 rows each -> rows / 8 threadgroups.
-// later: read ushort4 / x as float4 for wider loads, several rows per simdgroup.
+// mapping: each simdgroup (32 threads) owns ROWS_PER_SG rows; lanes stride over cols.
+//       All of a simdgroup's rows advance through the same chunk together, so their
+//       weight loads are in flight at once and share one x load. 256-thread
+//       threadgroups = 8 simdgroups = 8 * ROWS_PER_SG rows each.
+// ROWS_PER_SG is set at load time by metal_inference.rs (env MATVEC_ROWS_PER_SG).
+#ifndef ROWS_PER_SG
+#define ROWS_PER_SG 1
+#endif
+
 kernel void matvec_bf16(
-    device const ushort*   w    [[buffer(0)]],
-    device const float*    x    [[buffer(1)]],
+    device const packed_uint4*   w    [[buffer(0)]],
+    device const float4*    x    [[buffer(1)]],
     device float*          out  [[buffer(2)]],
     constant MatvecParams& p    [[buffer(3)]],
     uint tgid [[threadgroup_position_in_grid]],
@@ -134,12 +139,39 @@ kernel void matvec_bf16(
     uint sg   [[simdgroup_index_in_threadgroup]],
     uint sgs  [[simdgroups_per_threadgroup]])
 {
+	const uint first_row = (tgid * sgs + sg) * ROWS_PER_SG;
+	if (first_row >= p.rows) return;
 
-	
+	const uint chunks = p.cols / 8;   // one chunk = 16 bytes = 8 weights
 
+	// Where each row starts. Past the end of the matrix (the last, partial simdgroup)
+	// a slot re-reads the final row, which stays in bounds and keeps the loop below a
+	// fixed size for the compiler to unroll. Those slots are never written out.
+	uint row_start[ROWS_PER_SG];
+	float acc[ROWS_PER_SG];
+	for (uint r = 0; r < ROWS_PER_SG; r++) {
+		row_start[r] = min(first_row + r, p.rows - 1) * chunks;
+		acc[r] = 0.0f;
+	}
 
+	const uint hi = 0xFFFF0000u;
+	for (uint i = lane; i < chunks; i += 32) {
+		// shared by every row in this simdgroup
+		float4 x0 = x[2 * i];
+		float4 x1 = x[2 * i + 1];
 
+		for (uint r = 0; r < ROWS_PER_SG; r++) {
+			uint4 u = w[row_start[r] + i];
+			float4 w0 = as_type<float4>(uint4(u.x << 16, u.x & hi, u.y << 16, u.y & hi));
+			float4 w1 = as_type<float4>(uint4(u.z << 16, u.z & hi, u.w << 16, u.w & hi));
+			acc[r] += dot(w0, x0) + dot(w1, x1);
+		}
+	}
 
+	for (uint r = 0; r < ROWS_PER_SG; r++) {
+		float total = simd_sum(acc[r]);
+		if (lane == 0 && first_row + r < p.rows) out[first_row + r] = total;
+	}
 }
 
 // in place, per head: rmsnorm(head, norm_w) then rope(head, pos)   (cpu: the
