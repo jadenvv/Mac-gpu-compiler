@@ -5,10 +5,8 @@ and greedy decoding as the Rust side, then reports:
 
   1. out of the box   mlx_lm.stream_generate, exactly as a user would call it
                       (async pipelined decode). This is the headline target.
-  2. instrumented     the same measurements as tests/ttft.rs and tests/mbu.rs:
-                      TTFT (batched prefill, and token-by-token prefill like our engine),
-                      synchronous per-token decode latency, and MBU with the same
-                      bytes-per-token formula.
+  2. instrumented     the same measurements as tests/mbu.rs: synchronous per-token
+                      decode latency, and MBU with the same bytes-per-token formula.
 
 Results are written to results/mlx_<chip>_<prompt>.json.
 
@@ -36,7 +34,6 @@ MODEL_DIR = HERE.parent / "qwen3-0.6b"
 
 # "The capital of France is" (ids from vocab.json), same as tests/common/mod.rs
 PARIS_PROMPT = [785, 6722, 315, 9625, 374]
-PARIS = 12095
 # longer default prompt so prefill and attention over a real context get exercised
 AI_PROMPT = (
     "AI is going to take over the world, or at least that is what the headlines keep telling us. "
@@ -126,48 +123,8 @@ def out_of_the_box(model, tokenizer, prompt: list[int], max_tokens: int, runs: i
 
 
 # ---------------------------------------------------------------------------
-# 2. instrumented, mirrors tests/ttft.rs and tests/mbu.rs
+# 2. instrumented, mirrors tests/mbu.rs
 # ---------------------------------------------------------------------------
-
-def ttft_batched(model, prompt: list[int]) -> tuple[int, float]:
-    """MLX's normal prefill: the whole prompt in one forward pass."""
-    start = time.perf_counter()
-    cache = make_prompt_cache(model)
-    logits = model(mx.array(prompt)[None], cache=cache)
-    first = mx.argmax(logits[0, -1])
-    mx.eval(first)
-    return first.item(), time.perf_counter() - start
-
-
-def ttft_sequential(model, prompt: list[int]) -> tuple[int, float]:
-    """Token-by-token prefill, the way our engine's forward(token, pos) does it."""
-    start = time.perf_counter()
-    cache = make_prompt_cache(model)
-    for tok in prompt:
-        logits = model(mx.array([[tok]]), cache=cache)
-        mx.eval(logits)
-    first = mx.argmax(logits[0, -1])
-    mx.eval(first)
-    return first.item(), time.perf_counter() - start
-
-
-def ttft(model, prompt: list[int], runs: int) -> dict:
-    out = {}
-    for name, fn in [("batched", ttft_batched), ("sequential", ttft_sequential)]:
-        first, cold = fn(model, prompt)
-        if prompt == PARIS_PROMPT:
-            assert first == PARIS, f'{name}: expected " Paris" ({PARIS}), got {first}'
-        samples = []
-        for _ in range(runs):
-            tok, dt = fn(model, prompt)
-            assert tok == first, f"{name}: first token is not deterministic"
-            samples.append(dt)
-        stats = summarize(samples)
-        stats["first_call_ms"] = ms(cold)
-        stats["prefill_tps_median"] = len(prompt) / (stats["median_ms"] / 1e3)
-        out[name] = stats
-    return out
-
 
 def decode_mbu(model, prompt: list[int], decode_steps: int, peak_bw: float) -> dict:
     """Synchronous decode: each step is forward + argmax + wait, timed individually,
@@ -227,7 +184,7 @@ def main():
                     help=f"preset ({', '.join(PROMPTS)}) or literal text; 'paris' is the Rust tests' prompt (default ai)")
     ap.add_argument("--max-tokens", type=int, default=128, help="tokens to generate in the out-of-the-box run")
     ap.add_argument("--decode-steps", type=int, default=32, help="decode steps for MBU (tests/mbu.rs uses 32)")
-    ap.add_argument("--runs", type=int, default=5, help="timed repetitions (tests/ttft.rs uses 5)")
+    ap.add_argument("--runs", type=int, default=5, help="timed out-of-the-box repetitions")
     ap.add_argument("--peak-bw-gbs", type=float, default=None, help="override peak DRAM bandwidth")
     ap.add_argument("--out", type=Path, default=None, help="results JSON path (default results/mlx_<chip>.json)")
     args = ap.parse_args()
@@ -261,12 +218,6 @@ def main():
     print(f"generation     : {oob['generation_tps_median']:.1f} tok/s  (median of {args.runs}, {args.max_tokens} tokens)  <-- target")
     print(f"peak memory    : {oob['peak_memory_gb']:.2f} GB")
 
-    tt = ttft(model, prompt, args.runs)
-    print("\n-- TTFT (tests/ttft.rs) --")
-    for name, s in tt.items():
-        print(f"{name:<15}: median {s['median_ms']:.2f} ms | min {s['min_ms']:.2f} | max {s['max_ms']:.2f}  "
-              f"({s['prefill_tps_median']:.1f} tok/s prefill)")
-
     dec = decode_mbu(model, prompt, args.decode_steps, peak_bw)
     print("\n-- decode + MBU (tests/mbu.rs, synchronous per step) --")
     print(f"weights/token  : {dec['weight_bytes_per_token'] / 1e6:.1f} MB  (+ bf16 KV cache, {dec['kv_bytes_last_step'] / 1e6:.2f} MB at last step)")
@@ -290,7 +241,7 @@ def main():
     out.write_text(json.dumps({
         "chip": chip, "peak_bw_gbs": peak_bw, "mlx": mx.__version__, "mlx_lm": __import__("mlx_lm").__version__,
         "dtype": dtype, "prompt_name": prompt_name, "prompt": prompt, "load_ms": ms(load_s),
-        "out_of_the_box": oob, "ttft": tt, "decode": dec, "parity": parity,
+        "out_of_the_box": oob, "decode": dec, "parity": parity,
     }, indent=2))
     print(f"\nwrote {out.relative_to(HERE)}")
 

@@ -22,12 +22,28 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/qwen3-0.6b/model.safetensors");
 const RESULTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/mlx_baseline/results");
 
+// untimed prefills before decode is measured, the same load the old TTFT runs (1 cold + 3)
+// put on the engine, so new runs stay comparable with the recorded history
+const WARMUP_PASSES: usize = 4;
+
 // both engines behind one interface: fresh cache + one forward step
 trait Engine
 {
     fn reset(&mut self);
     fn step(&mut self, token: u32, pos: usize) -> Vec<f32>;
     fn model(&self) -> &Model;
+    // greedy decode: `steps` forward passes starting from `first`, calling on_token with each
+    // pass's token as it finishes. Timing it this way counts argmax, as MLX's timing does.
+    fn decode(&mut self, first: u32, start_pos: usize, steps: usize, on_token: &mut dyn FnMut(u32))
+    {
+        let mut tok = first;
+        for i in 0..steps
+        {
+            let logits = self.step(tok, start_pos + i);
+            tok = argmax(&logits);
+            on_token(tok);
+        }
+    }
 }
 
 struct Cpu { model: Model, cache: KVCache }
@@ -44,13 +60,17 @@ impl Engine for Metal
     fn reset(&mut self) { self.cache = MetalKVCache::new(&self.model, self.max_seq); }
     fn step(&mut self, token: u32, pos: usize) -> Vec<f32> { self.model.forward(token, pos, &mut self.cache) }
     fn model(&self) -> &Model { &self.model.cpu }
+    fn decode(&mut self, first: u32, start_pos: usize, steps: usize, on_token: &mut dyn FnMut(u32))
+    {
+        self.model.decode(first, start_pos, steps, &mut self.cache, on_token);
+    }
 }
 
-struct Args { engine: String, prompt: String, runs: usize, decode_steps: usize, label: String }
+struct Args { engine: String, prompt: String, decode_steps: usize, label: String }
 
 fn parse_args() -> Args
 {
-    let mut a = Args { engine: "metal".into(), prompt: "ai".into(), runs: 3, decode_steps: 32, label: String::new() };
+    let mut a = Args { engine: "metal".into(), prompt: "ai".into(), decode_steps: 128, label: String::new() };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next()
     {
@@ -59,10 +79,9 @@ fn parse_args() -> Args
         {
             "--engine" => a.engine = val(),
             "--prompt" => a.prompt = val(),
-            "--runs" => a.runs = val().parse().expect("--runs must be a number"),
             "--decode-steps" => a.decode_steps = val().parse().expect("--decode-steps must be a number"),
             "--label" => a.label = val(),
-            _ => panic!("unknown flag {flag} (use --engine cpu|metal, --prompt, --runs, --decode-steps, --label)"),
+            _ => panic!("unknown flag {flag} (use --engine cpu|metal, --prompt, --decode-steps, --label)"),
         }
     }
     assert!(a.engine == "cpu" || a.engine == "metal", "--engine must be cpu or metal");
@@ -108,16 +127,6 @@ fn median(xs: &[f64]) -> f64
     s[s.len() / 2]
 }
 
-// fresh cache, token-by-token prefill, pick the first token
-fn ttft(e: &mut dyn Engine, prompt: &[u32]) -> (u32, Duration)
-{
-    let start = Instant::now();
-    e.reset();
-    let mut logits = Vec::new();
-    for (pos, &tok) in prompt.iter().enumerate() { logits = e.step(tok, pos); }
-    (argmax(&logits), start.elapsed())
-}
-
 fn main()
 {
     let args = parse_args();
@@ -132,7 +141,7 @@ fn main()
     let mlx_tokens: Vec<u32> = serde_json::from_value(mlx["out_of_the_box"]["tokens"].clone()).unwrap();
 
     println!("engine  : {}  on {chip}", args.engine);
-    println!("prompt  : {} ({} tokens), {} decode steps, {} TTFT runs", args.prompt, prompt.len(), args.decode_steps, args.runs);
+    println!("prompt  : {} ({} tokens), {} decode steps", args.prompt, prompt.len(), args.decode_steps);
 
     let t = Instant::now();
     let max_seq = prompt.len() + args.decode_steps + 1;
@@ -153,34 +162,31 @@ fn main()
     };
     let load = t.elapsed();
 
-    // TTFT: first call pages in the mmap'd weights (and warms the GPU), then timed runs
-    let (first, cold) = ttft(engine.as_mut(), &prompt);
-    let mut ttft_ms = Vec::with_capacity(args.runs);
-    for i in 0..args.runs
+    // warm-up: the first pass also pages in the mmap'd weights
+    for _ in 0..WARMUP_PASSES
     {
-        let (tok, dt) = ttft(engine.as_mut(), &prompt);
-        assert_eq!(tok, first, "first token is not deterministic across runs");
-        ttft_ms.push(ms(dt));
-        println!("  ttft run {}/{}: {:.1} ms", i + 1, args.runs, ms(dt));
+        engine.reset();
+        for (pos, &tok) in prompt.iter().enumerate() { engine.step(tok, pos); }
     }
 
-    // decode: prefill once, then time every step on its own (like tests/mbu.rs)
+    // decode: prefill once, then time each token as the gap since the previous one finished
     let weight_bytes = weight_bytes_per_token(engine.model());
     engine.reset();
     let mut logits = Vec::new();
     for (pos, &tok) in prompt.iter().enumerate() { logits = engine.step(tok, pos); }
+    let first = argmax(&logits);
     let mut step_ms = Vec::with_capacity(args.decode_steps);
-    let mut tokens = Vec::with_capacity(args.decode_steps);
-    let mut total_bytes = 0usize;
-    for pos in prompt.len()..prompt.len() + args.decode_steps
-    {
-        let next = argmax(&logits);
-        tokens.push(next);
-        let start = Instant::now();
-        logits = engine.step(next, pos);
-        step_ms.push(ms(start.elapsed()));
-        total_bytes += weight_bytes + kv_bytes_at(&engine.model().config, pos);
-    }
+    let mut tokens = vec![first];
+    let mut last = Instant::now();
+    engine.decode(first, prompt.len(), args.decode_steps, &mut |tok| {
+        tokens.push(tok);
+        step_ms.push(ms(last.elapsed()));
+        last = Instant::now();
+    });
+    tokens.truncate(args.decode_steps); // the last pass's token isn't one MLX's run counted
+    let total_bytes: usize = (prompt.len()..prompt.len() + args.decode_steps)
+        .map(|pos| weight_bytes + kv_bytes_at(&engine.model().config, pos))
+        .sum();
     let decode_s: f64 = step_ms.iter().sum::<f64>() / 1e3;
     let achieved = total_bytes as f64 / decode_s;
 
@@ -199,8 +205,6 @@ fn main()
         "prompt_name": args.prompt,
         "prompt_tokens": prompt.len(),
         "load_ms": ms(load),
-        "first_token": first,
-        "ttft": { "first_call_ms": ms(cold), "median_ms": median(&ttft_ms), "samples_ms": ttft_ms },
         "decode": {
             "steps": args.decode_steps,
             "median_ms": median(&step_ms),
@@ -223,7 +227,6 @@ fn main()
 
     println!("decode  : {:.1} tok/s  ({:.1} ms/token median), MBU {:.1}%",
         result["decode"]["tps"].as_f64().unwrap(), median(&step_ms), achieved / peak * 100.0);
-    println!("ttft    : {:.1} ms median", median(&ttft_ms));
     match diverge
     {
         None => println!("parity  : greedy tokens match MLX for all {compared}"),

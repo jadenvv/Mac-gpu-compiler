@@ -32,13 +32,10 @@ struct NormParams {
 
 struct RopeParams {
     uint head_dim;
-    uint pos;
-    float theta;
     float eps;          // q/k norm is fused into this kernel
 };
 
 struct AttnParams {
-    uint n_heads;
     uint n_kv_heads;
     uint head_dim;
     uint pos;           // attend over cache positions 0..=pos
@@ -74,9 +71,23 @@ inline float tg_max(float v, threadgroup float* buf, uint lane, uint sg, uint tp
     return r;
 }
 
-// max head_dim supported by qk_norm_rope / attention, and max context for attention
+// same barrier contract as tg_sum, for the lowest index in argmax
+inline uint tg_min(uint v, threadgroup uint* buf, uint lane, uint sg, uint tpg)
+{
+    uint nsg = (tpg + 31) / 32;
+    v = simd_min(v);
+    if (lane == 0) buf[sg] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint r = simd_min(lane < nsg ? buf[lane] : UINT_MAX);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return r;
+}
+
+// max head_dim supported by qk_norm_rope, and max context for attention. attention keeps
+// scores for two q heads in threadgroup memory, so 2 * 4 * MAX_SEQ has to fit in 32 KB
+// along with its reduction scratch.
 constant uint MAX_HEAD_DIM = 256;
-constant uint MAX_SEQ      = 4096;
+constant uint MAX_SEQ      = 4064;
 
 // ---------------------------------------------------------------------------
 // kernels
@@ -87,7 +98,7 @@ constant uint MAX_SEQ      = 4096;
 kernel void embed(
     device const ushort* table  [[buffer(0)]],
     device float*        out    [[buffer(1)]],
-    constant uint&       token  [[buffer(2)]],
+    device const uint&   token  [[buffer(2)]],   // a buffer, so the previous step's argmax can feed it
     constant uint&       n      [[buffer(3)]],
     uint gid [[thread_position_in_grid]])
 {
@@ -174,15 +185,17 @@ kernel void matvec_bf16(
 	}
 }
 
-// in place, per head: rmsnorm(head, norm_w) then rope(head, pos)   (cpu: the
-// q_norm/k_norm + rope loops in forward). Used for both q and k.
+// in place, per head: rmsnorm(head, norm_w) then rope(head)   (cpu: the q_norm/k_norm +
+// rope loops in forward). Used for both q and k. rope is this position's [cos, sin] for
+// each i < head_dim/2, computed once on the CPU (MetalKVCache::new).
 // grid: one threadgroup per head, head_dim threads. The rmsnorm reduction is
 //       per-head, and rope pairs element i with i + head_dim/2, so you need a
 //       threadgroup_barrier between normalizing and rotating.
 kernel void qk_norm_rope(
     device float*        x      [[buffer(0)]],   // [n_heads * head_dim]
     device const ushort* norm_w [[buffer(1)]],   // [head_dim]
-    constant RopeParams& p      [[buffer(2)]],
+    device const float2* rope   [[buffer(2)]],   // [head_dim / 2]
+    constant RopeParams& p      [[buffer(3)]],
     uint head [[threadgroup_position_in_grid]],
     uint tid  [[thread_index_in_threadgroup]],
     uint tpg  [[threads_per_threadgroup]],
@@ -204,77 +217,107 @@ kernel void qk_norm_rope(
     // rope, HF rotate_half layout: i pairs with i + half
     const uint half_d = hd / 2;
     if (tid < half_d) {
-        // precise:: so this matches the CPU powf / sin_cos for parity
-        float freq = precise::pow(p.theta, -2.0f * float(tid) / float(hd));
-        float ang  = float(p.pos) * freq;
-        float sn = precise::sin(ang), cs = precise::cos(ang);
+        float2 r = rope[tid];
         float a = v[tid], b = v[tid + half_d];
-        h[tid]          = a * cs - b * sn;
-        h[tid + half_d] = b * cs + a * sn;
+        h[tid]          = a * r.x - b * r.y;
+        h[tid + half_d] = b * r.x + a * r.y;
     }
 }
 
-// out[h] = softmax(q[h] . K[0..=pos] * scale) @ V[0..=pos]   with GQA:
-// q head h reads kv head h / (n_heads / n_kv_heads).
+// out[h] = softmax(q[h] . K[0..=pos] * scale) @ V[0..=pos]   with GQA: each kv head serves
+// exactly two q heads (2 * kv_head and 2 * kv_head + 1), and both run together here so they
+// share one read of that head's K and V.
 // cache layout matches the CPU one: k_cache[t * kv_dim + kv_head * head_dim + i].
-// grid: one threadgroup per q head.
-// simple version: scores in a threadgroup array (caps pos at its size, e.g. 4096),
-//       max-reduce, exp + sum-reduce, then each thread owns output dims.
-// later: online softmax (flash-decoding style) to drop the length cap.
+// grid: one threadgroup per KV head, head_dim threads (must be 128: 4 simdgroups of 32).
+// Scores use the matvec pattern: a simdgroup owns a position and its lanes cover the head as
+// 32 float4s, so one position's loads are adjacent instead of 4 KB apart.
 kernel void attention(
-    device const float*  q       [[buffer(0)]],
-    device const float*  k_cache [[buffer(1)]],
+    device const float4* q       [[buffer(0)]],
+    device const float4* k_cache [[buffer(1)]],
     device const float*  v_cache [[buffer(2)]],
     device float*        out     [[buffer(3)]],
     constant AttnParams& p       [[buffer(4)]],
-    uint head [[threadgroup_position_in_grid]],
+    uint kvh  [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint tpg  [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    threadgroup float buf[32];
+    threadgroup float scores_a[MAX_SEQ];   // caller must keep pos < MAX_SEQ
+    threadgroup float scores_b[MAX_SEQ];
+
+    const uint hd     = p.head_dim;
+    const uint kv_dim = p.n_kv_heads * hd;
+    const uint n_t    = p.pos + 1;
+    const uint chunks = hd / 4;
+
+    const float4 qa = q[2 * kvh * chunks + lane];
+    const float4 qb = q[(2 * kvh + 1) * chunks + lane];
+
+    // scores[t] = q . k[t] * scale, one position per simdgroup
+    float local_a = -INFINITY, local_b = -INFINITY;
+    for (uint t = sg; t < n_t; t += sgs) {
+        float4 k = k_cache[(t * kv_dim + kvh * hd) / 4 + lane];
+        float a = simd_sum(dot(qa, k)) * p.scale;
+        float b = simd_sum(dot(qb, k)) * p.scale;
+        if (lane == 0) { scores_a[t] = a; scores_b[t] = b; }
+        local_a = max(local_a, a);
+        local_b = max(local_b, b);
+    }
+    const float max_a = tg_max(local_a, buf, lane, sg, tpg);
+    const float max_b = tg_max(local_b, buf, lane, sg, tpg);
+
+    // exp + sum
+    float sum_a = 0.0f, sum_b = 0.0f;
+    for (uint t = tid; t < n_t; t += tpg) {
+        float ea = precise::exp(scores_a[t] - max_a);
+        float eb = precise::exp(scores_b[t] - max_b);
+        scores_a[t] = ea;
+        scores_b[t] = eb;
+        sum_a += ea;
+        sum_b += eb;
+    }
+    // tg_sum's barriers also make all scores writes visible below
+    const float inv_a = 1.0f / tg_sum(sum_a, buf, lane, sg, tpg);
+    const float inv_b = 1.0f / tg_sum(sum_b, buf, lane, sg, tpg);
+
+    // out[i] = sum_t p[t] * v[t][i], one output dim per thread
+    device const float* v = v_cache + kvh * hd + tid;
+    float acc_a = 0.0f, acc_b = 0.0f;
+    for (uint t = 0; t < n_t; t++) {
+        float vt = v[t * kv_dim];
+        acc_a += scores_a[t] * vt;
+        acc_b += scores_b[t] * vt;
+    }
+    out[2 * kvh * hd + tid]       = acc_a * inv_a;
+    out[(2 * kvh + 1) * hd + tid] = acc_b * inv_b;
+}
+
+// *out = index of the largest x[i], lowest index on ties   (cpu: argmax)
+// grid: ONE threadgroup. Lets the next step's embed read this token without the CPU.
+kernel void argmax(
+    device const float* x   [[buffer(0)]],
+    device uint&        out [[buffer(1)]],
+    constant uint&      n   [[buffer(2)]],
     uint tid  [[thread_index_in_threadgroup]],
     uint tpg  [[threads_per_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg   [[simdgroup_index_in_threadgroup]])
 {
-    threadgroup float buf[32];
-    threadgroup float qs[MAX_HEAD_DIM];
-    threadgroup float scores[MAX_SEQ];   // caller must keep pos < MAX_SEQ
+    threadgroup float fbuf[32];
+    threadgroup uint  ubuf[32];
 
-    const uint hd     = p.head_dim;
-    const uint kv_dim = p.n_kv_heads * hd;
-    const uint kvh    = head / (p.n_heads / p.n_kv_heads);
-    const uint n_t    = p.pos + 1;
-
-    // stage this head's q in threadgroup memory; every thread reads all of it
-    for (uint i = tid; i < hd; i += tpg) qs[i] = q[head * hd + i];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // scores[t] = q . k[t] * scale, one position per thread
-    float local_max = -INFINITY;
-    for (uint t = tid; t < n_t; t += tpg) {
-        device const float* k = k_cache + t * kv_dim + kvh * hd;
-        float d = 0.0f;
-        for (uint i = 0; i < hd; i++) d += qs[i] * k[i];
-        d *= p.scale;
-        scores[t] = d;
-        local_max = max(local_max, d);
+    float best = -INFINITY;
+    uint best_i = UINT_MAX;
+    for (uint i = tid; i < n; i += tpg) {
+        if (x[i] > best) { best = x[i]; best_i = i; }
     }
-    float m = tg_max(local_max, buf, lane, sg, tpg);
-
-    // exp + sum
-    float local_sum = 0.0f;
-    for (uint t = tid; t < n_t; t += tpg) {
-        float e = precise::exp(scores[t] - m);
-        scores[t] = e;
-        local_sum += e;
-    }
-    // tg_sum's barriers also make all scores[] writes visible below
-    float inv = 1.0f / tg_sum(local_sum, buf, lane, sg, tpg);
-
-    // out[i] = sum_t p[t] * v[t][i], each thread owns output dims
-    for (uint i = tid; i < hd; i += tpg) {
-        device const float* v = v_cache + kvh * hd + i;
-        float acc = 0.0f;
-        for (uint t = 0; t < n_t; t++) acc += scores[t] * v[t * kv_dim];
-        out[head * hd + i] = acc * inv;
-    }
+    float m = tg_max(best, fbuf, lane, sg, tpg);
+    uint i = tg_min(best == m ? best_i : UINT_MAX, ubuf, lane, sg, tpg);
+    // nothing compared greater (all NaN or -inf): the CPU argmax returns 0
+    if (tid == 0) out = i == UINT_MAX ? 0 : i;
 }
 
 // gate[i] = silu(gate[i]) * up[i]

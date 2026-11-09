@@ -38,3 +38,34 @@ fn metal_matches_cpu()
         if pos == PROMPT.len() - 1 { assert_eq!(argmax(&b), PARIS); }
     }
 }
+
+// decode()'s pipelined steps and GPU argmax must pick what forward() + CPU argmax picks,
+// with enough context that attention has more positions than simdgroups
+#[test]
+fn pipelined_decode_matches_forward()
+{
+    const STEPS: usize = 48;
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/qwen3-0.6b/model.safetensors");
+    let gpu = MetalModel::load_model(path).unwrap();
+    let max_seq = PROMPT.len() + STEPS + 1;
+
+    let mut cache = MetalKVCache::new(&gpu, max_seq);
+    let mut logits = Vec::new();
+    for (pos, &tok) in PROMPT.iter().enumerate() { logits = gpu.forward(tok, pos, &mut cache); }
+    let first = argmax(&logits);
+
+    let mut expected = Vec::with_capacity(STEPS);
+    let mut tok = first;
+    for i in 0..STEPS
+    {
+        tok = argmax(&gpu.forward(tok, PROMPT.len() + i, &mut cache));
+        expected.push(tok);
+    }
+
+    let mut cache = MetalKVCache::new(&gpu, max_seq);
+    for (pos, &tok) in PROMPT.iter().enumerate() { gpu.forward(tok, pos, &mut cache); }
+    let mut got = Vec::with_capacity(STEPS);
+    gpu.decode(first, PROMPT.len(), STEPS, &mut cache, &mut |t| got.push(t));
+
+    assert_eq!(got, expected);
+}

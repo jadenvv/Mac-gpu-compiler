@@ -60,10 +60,8 @@ Also check that `rustc -vV | grep host` says `aarch64-apple-darwin`.
 
 | metric | MLX side | your side |
 |---|---|---|
-| Decode speed | `mlx_lm.stream_generate` tok/s, 128 tokens (async pipelined) | 32 synchronous decode steps |
-| Time per token / MBU | synchronous per-step, same bytes/token formula as `tests/mbu.rs` | same |
-| TTFT token-by-token | prompt fed one token at a time, like `forward(tok, pos)` | same |
-| TTFT vs batched | MLX's normal whole-prompt prefill | yours (token-by-token until you add batched prefill) |
+| Decode speed | `mlx_lm.stream_generate` tok/s, 128 tokens (async pipelined) | 128 pipelined decode steps, argmax included |
+| Time per token / MBU | synchronous per-step, 32 steps, same bytes/token formula as `tests/mbu.rs` | gap between finished tokens from the same run, same formula |
 
 Notes:
 - Needs a native arm64 Python (pinned in `.python-version`); under Rosetta, MLX won't load.

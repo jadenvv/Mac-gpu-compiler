@@ -7,5 +7,6 @@ default-run = "metal_infrence_engine"
 [dependencies]
 memmap2 = "0.9.11"
 metal = "0.33.0"
+objc = "0.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

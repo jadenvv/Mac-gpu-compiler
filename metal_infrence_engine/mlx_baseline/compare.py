@@ -48,16 +48,10 @@ def metrics(mlx: dict, run: dict) -> list[dict]:
              note="vs mlx_lm.stream_generate out of the box"),
         dict(key="latency", name="Time per token", unit="ms", higher=False,
              mlx=mlx["decode"]["time_per_token"]["median_ms"], you=run["decode"]["median_ms"],
-             note="median decode step, both synchronous"),
+             note="median token; MLX synchronous, yours pipelined"),
         dict(key="mbu", name="Bandwidth used (MBU)", unit="%", higher=True,
              mlx=mlx["decode"]["mbu"] * 100, you=run["decode"]["mbu"] * 100,
              note="share of peak memory bandwidth"),
-        dict(key="ttft_seq", name="TTFT, token-by-token", unit="ms", higher=False,
-             mlx=mlx["ttft"]["sequential"]["median_ms"], you=run["ttft"]["median_ms"],
-             note="same prefill method as your forward(tok, pos)"),
-        dict(key="ttft", name="TTFT vs MLX batched", unit="ms", higher=False,
-             mlx=mlx["ttft"]["batched"]["median_ms"], you=run["ttft"]["median_ms"],
-             note="what a user waits for; needs batched prefill to win"),
     ]
 
 
@@ -155,12 +149,11 @@ def main():
     ap.add_argument("--run", choices=["cpu", "metal"], help="benchmark this engine first (cargo run --release --bin bench)")
     ap.add_argument("--label", default="", help="what you changed, shown in the run history")
     ap.add_argument("--prompt", default="ai", help="prompt preset the MLX baseline was run with (default ai)")
-    ap.add_argument("--runs", type=int, default=3, help="TTFT repetitions for --run")
     args = ap.parse_args()
 
     if args.run:
         cmd = ["cargo", "run", "--release", "--bin", "bench", "--", "--engine", args.run,
-               "--prompt", args.prompt, "--runs", str(args.runs), "--label", args.label]
+               "--prompt", args.prompt, "--label", args.label]
         if subprocess.run(cmd, cwd=CRATE).returncode != 0:
             sys.exit("engine benchmark failed")
 
