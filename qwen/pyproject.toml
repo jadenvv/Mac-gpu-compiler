@@ -1,0 +1,18 @@
+[project]
+name = "olmoe-inference"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "huggingface-hub>=2.4.0",
+    "jax>=0.6",
+    "ml-dtypes>=0.7.0",
+    "numpy>=2.5.5",
+    "tokenizers>=0.23.3",
+]
+
+[project.optional-dependencies]
+# On the Colab TPU VM: uv sync --extra tpu
+tpu = ["jax[tpu]>=0.6 ; sys_platform == 'linux'"]
+
+[tool.uv]
+required-environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'", "sys_platform == 'linux' and platform_machine == 'x86_64'"]
