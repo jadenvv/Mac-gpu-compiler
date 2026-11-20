@@ -11,6 +11,7 @@ import json
 import mmap
 import os
 from dataclasses import dataclass
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -122,11 +123,26 @@ def quantize_layer(lp: dict, spec: QuantSpec) -> dict:
     return {k: quantize(jnp.asarray(v), spec.bits, spec.group) if k in names else v for k, v in lp.items()}
 
 
+@partial(jax.jit, donate_argnums=0)
+def _set_layer(buf, x, i):
+    return jax.lax.dynamic_update_index_in_dim(buf, x, i, axis=0)
+
+
 def stack_layers(layers: list[dict]) -> dict:
     """List of per-layer dicts -> one dict with a leading L axis on every leaf."""
     if all(isinstance(v, np.ndarray) for v in layers[0].values()):
-        # bf16 path: stack on the host, one transfer per tensor.
-        return {k: jnp.asarray(np.stack([lp[k] for lp in layers])) for k in layers[0]}
+        # bf16 path: preallocate each stacked tensor on device and copy one layer
+        # in at a time (buffer donated, so updated in place). Sending a whole
+        # 7.7 GiB expert stack at once needs a same-sized temporary on device,
+        # which doesn't fit once the model's ~27 GiB is mostly loaded.
+        out = {}
+        for k in layers[0]:
+            first = layers[0][k]
+            buf = jnp.zeros((len(layers),) + first.shape, first.dtype)
+            for i, lp in enumerate(layers):
+                buf = _set_layer(buf, jnp.asarray(lp[k]), jnp.int32(i))
+            out[k] = jax.block_until_ready(buf)
+        return out
     # Quantized path: leaves already on device (QArray is a pytree).
     return jax.tree.map(lambda *xs: jnp.stack(xs), *layers)
 

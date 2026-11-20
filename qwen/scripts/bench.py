@@ -101,6 +101,11 @@ def bench_model(args):
     from qmoe.weights import QuantSpec, load, param_bytes
 
     spec = QuantSpec.parse(args.quant, args.group, args.targets)
+    if args.reset_baseline and (spec.bits or any(v != "reference" for v in dict(K.signature()).values())):
+        raise SystemExit("--reset-baseline re-measures the baseline: use bf16 with reference kernels")
+    if not args.reset_baseline and not args.name:
+        raise SystemExit("--name is required (the run is saved as results/runs/<name>.json and compared "
+                         "to the cached baseline; pass --reset-baseline to re-measure the baseline instead)")
     t = time.perf_counter()
     cfg, params, _ = load(args.model_path, spec)
     print(f"loaded {spec.name()} in {time.perf_counter() - t:.0f}s: {param_bytes(params) / 1e9:.2f} GB on device")
@@ -131,11 +136,22 @@ def bench_model(args):
             eng.generate(tok, args.trace_steps)
         print(f"trace written to {args.trace} (open the .trace.json.gz in https://ui.perfetto.dev)")
 
+    res = dict(device=kind, quant=spec.name(), kernels=dict(K.signature()),
+               prompt_len=r.prompt_len, gen_len=len(r.ids), max_seq=args.max_seq,
+               ttft_ms=r.prefill_s * 1e3, prefill_tok_s=r.prompt_len / r.prefill_s,
+               decode_tok_s=r.decode_tok_s, ms_per_token=ms_tok,
+               mbu_pct=100 * (ideal / (ms_tok / 1e3)) / bw,
+               ideal_gb_per_token=ideal / 1e9, gb_on_device=param_bytes(params) / 1e9)
     if args.json:
         with open(args.json, "w") as f:
-            json.dump(dict(device=kind, quant=spec.name(), kernels=dict(K.signature()),
-                           prefill_tok_s=r.prompt_len / r.prefill_s, decode_tok_s=r.decode_tok_s,
-                           ideal_gb_per_token=ideal / 1e9, gb_on_device=param_bytes(params) / 1e9), f, indent=1)
+            json.dump(res, f, indent=1)
+
+    from scripts import results as R
+    if args.reset_baseline:
+        R.save_baseline("bench", res)
+    else:
+        print(f"saved run to {R.save_run(args.name, 'bench', res)}")
+    R.show_bench(None if args.reset_baseline else res)
 
 
 def main():
@@ -160,6 +176,10 @@ def main():
     ap.add_argument("--max-seq", type=int, default=2048, help="KV cache length (reference attention reads all of it)")
     ap.add_argument("--chunk", type=int, default=512)
     ap.add_argument("--repeats", type=int, default=3)
+    ap.add_argument("--name", help="--model: save this run as results/runs/<name>.json and compare it to the cached baseline")
+    ap.add_argument("--reset-baseline", action="store_true",
+                    help="--model: re-measure the bf16 reference baseline and overwrite results/baseline.json "
+                         "(otherwise the cached baseline is only read, never re-run)")
     ap.add_argument("--trace", help="write a profiler trace of decode steps to this dir")
     ap.add_argument("--trace-steps", type=int, default=16)
     args = ap.parse_args()

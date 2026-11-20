@@ -11,3 +11,6 @@ metal_infrence_engine/qwen3-0.6b/
 
 # Local-only notes
 claude.MD
+
+# Python virtualenvs (uv)
+.venv/
